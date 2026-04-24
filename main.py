@@ -17,9 +17,13 @@ app.add_middleware(
 )
 
 PLATFORM_PATTERNS = {
-    "youtube.com": "youtube", "youtu.be": "youtube",
-    "facebook.com": "facebook", "fb.watch": "facebook", "fb.com": "facebook",
-    "instagram.com": "instagram", "instagr.am": "instagram",
+    "youtube.com": "youtube",
+    "youtu.be": "youtube",
+    "facebook.com": "facebook",
+    "fb.watch": "facebook",
+    "fb.com": "facebook",
+    "instagram.com": "instagram",
+    "instagr.am": "instagram",
 }
 
 def detect_platform(url: str):
@@ -50,13 +54,39 @@ class DownloadRequest(BaseModel):
     format: str = "video"
     quality: str = "1080p"
 
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
+
 @app.get("/debug")
 def debug():
     return {"yt-dlp-version": yt_dlp.version.__version__}
+
+
+@app.post("/formats")
+def formats(req: AnalyzeRequest):
+    opts = {
+        **YDL_BASE_OPTS,
+        "skip_download": True,
+        "format": "best/bestvideo+bestaudio",
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(req.url.strip(), download=False)
+    available = [
+        {
+            "id": f.get("format_id"),
+            "ext": f.get("ext"),
+            "height": f.get("height"),
+            "note": f.get("format_note"),
+            "vcodec": f.get("vcodec"),
+            "acodec": f.get("acodec"),
+        }
+        for f in info.get("formats", [])
+    ]
+    return {"count": len(available), "formats": available}
+
 
 @app.post("/analyze")
 def analyze(req: AnalyzeRequest):
@@ -68,11 +98,11 @@ def analyze(req: AnalyzeRequest):
     if not platform:
         raise HTTPException(400, "This platform is not yet supported. Try YouTube, Facebook, or Instagram.")
 
-   opts = {
-    **YDL_BASE_OPTS,
-    "skip_download": True,
-    "format": "best/bestvideo+bestaudio",   # ← permissive, takes whatever exists
-}
+    opts = {
+        **YDL_BASE_OPTS,
+        "skip_download": True,
+        "format": "best/bestvideo+bestaudio",
+    }
 
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -87,9 +117,9 @@ def analyze(req: AnalyzeRequest):
         for f in info.get("formats", []):
             vcodec = f.get("vcodec", "none")
             acodec = f.get("acodec", "none")
-            height  = f.get("height")
-            ext     = f.get("ext", "mp4")
-            furl    = f.get("url", "")
+            height = f.get("height")
+            ext = f.get("ext", "mp4")
+            furl = f.get("url", "")
 
             if not furl:
                 continue
@@ -119,16 +149,16 @@ def analyze(req: AnalyzeRequest):
         return {
             "phase": "ready",
             "videoInfo": {
-                "title":        info.get("title", "Media"),
-                "thumbnail":    info.get("thumbnail", ""),
-                "author":       info.get("uploader") or info.get("channel") or platform.capitalize(),
-                "duration":     duration_str,
+                "title": info.get("title", "Media"),
+                "thumbnail": info.get("thumbnail", ""),
+                "author": info.get("uploader") or info.get("channel") or platform.capitalize(),
+                "duration": duration_str,
                 "videoStreams": video_streams[:6],
                 "audioStreams": audio_streams[:3],
             },
             "downloadUrl": None,
-            "progress":    0,
-            "error":       None,
+            "progress": 0,
+            "error": None,
         }
 
     except HTTPException:
@@ -149,6 +179,7 @@ def download(req: DownloadRequest):
         raise HTTPException(400, "Unsupported platform.")
 
     tmpdir = tempfile.mkdtemp()
+
     try:
         ext = "mp3" if req.format == "audio" else "mp4"
         out_template = os.path.join(tmpdir, "media.%(ext)s")
@@ -156,9 +187,9 @@ def download(req: DownloadRequest):
         quality_height = {
             "4K (2160p)": 2160,
             "1080p": 1080,
-            "720p":   720,
-            "480p":   480,
-            "360p":   360,
+            "720p": 720,
+            "480p": 480,
+            "360p": 360,
         }
         max_h = quality_height.get(req.quality, 1080)
 
@@ -167,11 +198,13 @@ def download(req: DownloadRequest):
                 **YDL_BASE_OPTS,
                 "format": "bestaudio/best",
                 "outtmpl": out_template,
-                "postprocessors": [{
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "192",
-                }],
+                "postprocessors": [
+                    {
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": "mp3",
+                        "preferredquality": "192",
+                    }
+                ],
             }
         else:
             opts = {
@@ -179,10 +212,12 @@ def download(req: DownloadRequest):
                 "format": f"bestvideo[height<={max_h}]+bestaudio/bestvideo[height<={max_h}]/best[height<={max_h}]/best",
                 "outtmpl": out_template,
                 "merge_output_format": "mp4",
-                "postprocessors": [{
-                    "key": "FFmpegVideoConvertor",
-                    "preferedformat": "mp4",
-                }],
+                "postprocessors": [
+                    {
+                        "key": "FFmpegVideoConvertor",
+                        "preferedformat": "mp4",
+                    }
+                ],
             }
 
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -192,9 +227,9 @@ def download(req: DownloadRequest):
         if not files:
             raise HTTPException(500, "No file was produced.")
 
-        filepath  = os.path.join(tmpdir, files[0])
+        filepath = os.path.join(tmpdir, files[0])
         safe_name = re.sub(r'[<>:"/\\|?*]', '', os.path.splitext(files[0])[0])[:80]
-        filename  = f"{safe_name}.{ext}"
+        filename = f"{safe_name}.{ext}"
 
         def stream_file():
             try:
