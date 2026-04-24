@@ -51,33 +51,125 @@ def extract_youtube_id(url: str):
         pass
     return None
 
-# Piped public instances — all free, no API key needed
+INVIDIOUS_INSTANCES = [
+    "https://invidious.snopyta.org",
+    "https://yt.artemislena.eu",
+    "https://invidious.nerdvpn.de",
+    "https://invidious.privacydev.net",
+    "https://inv.tux.pizza",
+    "https://invidious.fdn.fr",
+    "https://invidious.lunar.icu",
+    "https://iv.datura.network",
+]
+
 PIPED_INSTANCES = [
     "https://pipedapi.kavin.rocks",
     "https://piped-api.garudalinux.org",
     "https://api.piped.projectsegfau.lt",
-    "https://pipedapi.in.projectsegfau.lt",
     "https://pipedapi.adminforge.de",
 ]
 
-def fetch_piped_streams(video_id: str):
-    """Try each Piped instance until one works. Returns raw streams data or None."""
-    for instance in PIPED_INSTANCES:
+def fetch_streams(video_id: str):
+    # --- Try Invidious first ---
+    for instance in INVIDIOUS_INSTANCES:
         try:
-            req_url = f"{instance}/streams/{video_id}"
-            print(f"Trying Piped instance: {instance}")
+            req_url = f"{instance}/api/v1/videos/{video_id}?fields=title,author,videoThumbnails,lengthSeconds,adaptiveFormats,formatStreams"
+            print(f"Trying Invidious: {instance}")
             request = urllib.request.Request(
                 req_url,
                 headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
             )
             with urllib.request.urlopen(request, timeout=10) as r:
                 data = json.loads(r.read().decode())
-            if data and ("videoStreams" in data or "audioStreams" in data):
-                print(f"Piped success: {instance}")
-                return data
+
+            if not data or ("adaptiveFormats" not in data and "formatStreams" not in data):
+                continue
+
+            video_streams = []
+            audio_streams = []
+
+            for f in data.get("formatStreams", []):
+                if f.get("url") and f.get("resolution"):
+                    video_streams.append({
+                        "url": f["url"],
+                        "quality": f.get("qualityLabel") or f.get("resolution", "?"),
+                        "height": int(f.get("resolution", "0p").replace("p", "") or 0),
+                        "mimeType": f.get("type", "video/mp4").split(";")[0],
+                        "videoOnly": False,
+                    })
+
+            for f in data.get("adaptiveFormats", []):
+                mime = f.get("type", "")
+                furl = f.get("url", "")
+                if not furl:
+                    continue
+                if "audio" in mime:
+                    audio_streams.append({
+                        "url": furl,
+                        "bitrate": f.get("bitrate", 128000),
+                        "mimeType": mime.split(";")[0],
+                    })
+                elif "video" in mime and f.get("resolution"):
+                    height = int(f.get("resolution", "0p").replace("p", "") or 0)
+                    video_streams.append({
+                        "url": furl,
+                        "quality": f.get("qualityLabel") or f.get("resolution", "?"),
+                        "height": height,
+                        "mimeType": mime.split(";")[0],
+                        "videoOnly": True,
+                    })
+
+            if video_streams or audio_streams:
+                print(f"Invidious success: {instance} — {len(video_streams)} video, {len(audio_streams)} audio")
+                return {"videoStreams": video_streams, "audioStreams": audio_streams}
+
         except Exception as e:
-            print(f"Piped instance {instance} failed: {e}")
+            print(f"Invidious {instance} failed: {e}")
             continue
+
+    # --- Try Piped as fallback ---
+    for instance in PIPED_INSTANCES:
+        try:
+            req_url = f"{instance}/streams/{video_id}"
+            print(f"Trying Piped: {instance}")
+            request = urllib.request.Request(
+                req_url,
+                headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+            )
+            with urllib.request.urlopen(request, timeout=10) as r:
+                data = json.loads(r.read().decode())
+
+            if not data or ("videoStreams" not in data and "audioStreams" not in data):
+                continue
+
+            video_streams = []
+            audio_streams = []
+
+            for s in data.get("videoStreams", []):
+                if s.get("url"):
+                    video_streams.append({
+                        "url": s["url"],
+                        "quality": s.get("quality", "?"),
+                        "height": s.get("height", 0),
+                        "mimeType": s.get("mimeType", "video/mp4"),
+                        "videoOnly": s.get("videoOnly", False),
+                    })
+            for s in data.get("audioStreams", []):
+                if s.get("url"):
+                    audio_streams.append({
+                        "url": s["url"],
+                        "bitrate": s.get("bitrate", 128000),
+                        "mimeType": s.get("mimeType", "audio/mp4"),
+                    })
+
+            if video_streams or audio_streams:
+                print(f"Piped success: {instance}")
+                return {"videoStreams": video_streams, "audioStreams": audio_streams}
+
+        except Exception as e:
+            print(f"Piped {instance} failed: {e}")
+            continue
+
     return None
 
 YDL_BASE_OPTS = {
@@ -129,7 +221,7 @@ def analyze(req: AnalyzeRequest):
             if not video_id:
                 raise HTTPException(400, "Could not extract YouTube video ID.")
 
-            # Step 1: get title/author/thumbnail from oEmbed (free, no key needed)
+            # Get title/author/thumbnail from oEmbed
             title = "YouTube Video"
             author = "Unknown"
             thumbnail = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
@@ -147,17 +239,18 @@ def analyze(req: AnalyzeRequest):
             except Exception as e:
                 print(f"oEmbed failed: {e}")
 
-            # Step 2: get stream quality options from Piped (free, no key needed)
+            # Get stream options from Invidious/Piped
+            streams_data = fetch_streams(video_id)
+
             video_streams = []
             audio_streams = []
-            streams_data = fetch_piped_streams(video_id)
 
             if streams_data:
                 for s in streams_data.get("videoStreams", []):
                     if not s.get("videoOnly", True) and s.get("url"):
                         video_streams.append({
                             "url": s["url"],
-                            "quality": s.get("quality") or f"{s.get('height', '?')}p",
+                            "quality": s.get("quality", "?"),
                             "mimeType": s.get("mimeType", "video/mp4"),
                         })
                 for s in streams_data.get("audioStreams", []):
@@ -169,7 +262,7 @@ def analyze(req: AnalyzeRequest):
                             "mimeType": s.get("mimeType", "audio/mp4"),
                         })
 
-            # Fallback quality list if Piped is down
+            # Fallback if all APIs are down
             if not video_streams:
                 base = os.getenv("RENDER_EXTERNAL_URL", "")
                 video_streams = [
@@ -251,9 +344,9 @@ def download(req: DownloadRequest):
             if not video_id:
                 raise HTTPException(400, "Could not extract YouTube video ID.")
 
-            streams_data = fetch_piped_streams(video_id)
+            streams_data = fetch_streams(video_id)
             if not streams_data:
-                raise HTTPException(422, "Could not fetch stream URLs. All Piped instances are unavailable. Please try again later.")
+                raise HTTPException(422, "Could not fetch stream URLs. Please try again later.")
 
             quality_height = {
                 "4K (2160p)": 2160,
@@ -268,14 +361,17 @@ def download(req: DownloadRequest):
                 audio_streams = streams_data.get("audioStreams", [])
                 if not audio_streams:
                     raise HTTPException(422, "No audio streams available for this video.")
-                # pick highest quality audio
-                stream = sorted(audio_streams, key=lambda s: s.get("bitrate", 0), reverse=True)[0]
+                stream = sorted(
+                    audio_streams,
+                    key=lambda s: s.get("bitrate", 0),
+                    reverse=True
+                )[0]
                 stream_url = stream["url"]
                 filename = "audio.mp3"
 
             else:
                 video_streams = streams_data.get("videoStreams", [])
-                # prefer combined streams (video+audio) at or below requested height
+                # prefer combined streams at or below requested height
                 combined = [
                     s for s in video_streams
                     if not s.get("videoOnly", True)
@@ -283,20 +379,24 @@ def download(req: DownloadRequest):
                     and (s.get("height") or 0) <= max_h
                 ]
                 if not combined:
-                    # relax height constraint
-                    combined = [s for s in video_streams if not s.get("videoOnly", True) and s.get("url")]
+                    combined = [
+                        s for s in video_streams
+                        if not s.get("videoOnly", True) and s.get("url")
+                    ]
                 if not combined:
-                    # take anything
                     combined = [s for s in video_streams if s.get("url")]
                 if not combined:
                     raise HTTPException(422, "No video streams available for this video.")
 
-                # pick best quality within limit
-                stream = sorted(combined, key=lambda s: s.get("height") or 0, reverse=True)[0]
+                stream = sorted(
+                    combined,
+                    key=lambda s: s.get("height") or 0,
+                    reverse=True
+                )[0]
                 stream_url = stream["url"]
                 filename = "video.mp4"
 
-            print(f"Returning direct stream URL for {platform}: {stream_url[:80]}...")
+            print(f"Returning direct stream URL: {stream_url[:80]}...")
             return {
                 "downloadUrl": stream_url,
                 "filename": filename,
@@ -304,7 +404,7 @@ def download(req: DownloadRequest):
             }
 
         else:
-            # Facebook / Instagram — use yt-dlp and stream through server
+            # Facebook / Instagram — stream through server using yt-dlp
             tmpdir = tempfile.mkdtemp()
             try:
                 ext = "mp3" if req.format == "audio" else "mp4"
@@ -339,8 +439,7 @@ def download(req: DownloadRequest):
                 filepath = os.path.join(tmpdir, files[0])
                 safe_name = re.sub(r'[<>:"/\\|?*]', '', os.path.splitext(files[0])[0])[:80]
                 filename = f"{safe_name}.{ext}"
-
-                print(f"Streaming file: {filename} ({os.path.getsize(filepath)} bytes)")
+                print(f"Streaming: {filename} ({os.path.getsize(filepath)} bytes)")
 
                 def stream_file():
                     try:
