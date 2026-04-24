@@ -34,11 +34,11 @@ YDL_BASE_OPTS = {
     "no_warnings": False,
     "extractor_args": {
         "youtube": {
-            "player_client": ["ios", "web"],
+            "player_client": ["ios", "android", "web"],
         }
     },
     "http_headers": {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+        "User-Agent": "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)",
     },
 }
 
@@ -68,10 +68,11 @@ def analyze(req: AnalyzeRequest):
     if not platform:
         raise HTTPException(400, "This platform is not yet supported. Try YouTube, Facebook, or Instagram.")
 
-    opts = {
-        **YDL_BASE_OPTS,
-        "skip_download": True,
-    }
+   opts = {
+    **YDL_BASE_OPTS,
+    "skip_download": True,
+    "format": "best/bestvideo+bestaudio",   # ← permissive, takes whatever exists
+}
 
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -175,7 +176,7 @@ def download(req: DownloadRequest):
         else:
             opts = {
                 **YDL_BASE_OPTS,
-                "format": f"bestvideo[height<={max_h}][ext=mp4]+bestaudio[ext=m4a]/best[height<={max_h}]",
+                "format": f"bestvideo[height<={max_h}]+bestaudio/bestvideo[height<={max_h}]/best[height<={max_h}]/best",
                 "outtmpl": out_template,
                 "merge_output_format": "mp4",
                 "postprocessors": [{
