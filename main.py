@@ -1,8 +1,9 @@
-import os, subprocess, tempfile, shutil, re, json
+import os, re, json, tempfile, shutil
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+import yt_dlp
 
 app = FastAPI()
 
@@ -28,6 +29,19 @@ def detect_platform(url: str):
             return platform
     return None
 
+YDL_BASE_OPTS = {
+    "quiet": True,
+    "no_warnings": False,
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["ios", "web"],
+        }
+    },
+    "http_headers": {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+    },
+}
+
 class AnalyzeRequest(BaseModel):
     url: str
 
@@ -42,12 +56,7 @@ def health():
 
 @app.get("/debug")
 def debug():
-    ytdlp = subprocess.run(["yt-dlp", "--version"], capture_output=True, text=True)
-    ffmpeg = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True)
-    return {
-        "yt-dlp": ytdlp.stdout.strip() or ytdlp.stderr.strip(),
-        "ffmpeg": ffmpeg.stdout[:80].strip() or ffmpeg.stderr[:80].strip(),
-    }
+    return {"yt-dlp-version": yt_dlp.version.__version__}
 
 @app.post("/analyze")
 def analyze(req: AnalyzeRequest):
@@ -59,24 +68,17 @@ def analyze(req: AnalyzeRequest):
     if not platform:
         raise HTTPException(400, "This platform is not yet supported. Try YouTube, Facebook, or Instagram.")
 
+    opts = {
+        **YDL_BASE_OPTS,
+        "skip_download": True,
+    }
+
     try:
-        result = subprocess.run(
-            [
-                "yt-dlp",
-                "--dump-json",
-                "--no-playlist",
-                "--extractor-args", "youtube:player_client=web",
-                url,
-            ],
-            capture_output=True, text=True, timeout=60
-        )
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
 
-        if result.returncode != 0:
-            print("yt-dlp stderr:", result.stderr[:500])
-            print("yt-dlp stdout:", result.stdout[:500])
-            raise HTTPException(422, f"Could not fetch media info: {result.stderr[:200]}")
-
-        info = json.loads(result.stdout)
+        if not info:
+            raise HTTPException(422, "Could not fetch media info. The video may be private or restricted.")
 
         video_streams = []
         audio_streams = []
@@ -84,23 +86,23 @@ def analyze(req: AnalyzeRequest):
         for f in info.get("formats", []):
             vcodec = f.get("vcodec", "none")
             acodec = f.get("acodec", "none")
-            height = f.get("height")
-            ext = f.get("ext", "mp4")
-            url_f = f.get("url", "")
+            height  = f.get("height")
+            ext     = f.get("ext", "mp4")
+            furl    = f.get("url", "")
 
-            if not url_f:
+            if not furl:
                 continue
 
             if vcodec != "none" and acodec != "none" and height:
                 video_streams.append({
-                    "url": url_f,
+                    "url": furl,
                     "quality": f.get("format_note") or f"{height}p",
                     "mimeType": f"video/{ext}",
                 })
             elif vcodec == "none" and acodec != "none":
                 bitrate = f.get("abr") or f.get("tbr") or 128
                 audio_streams.append({
-                    "url": url_f,
+                    "url": furl,
                     "quality": f"{int(bitrate)} kbps",
                     "mimeType": f"audio/{ext}",
                 })
@@ -116,24 +118,23 @@ def analyze(req: AnalyzeRequest):
         return {
             "phase": "ready",
             "videoInfo": {
-                "title": info.get("title", "Media"),
-                "thumbnail": info.get("thumbnail", ""),
-                "author": info.get("uploader") or info.get("channel") or platform.capitalize(),
-                "duration": duration_str,
+                "title":        info.get("title", "Media"),
+                "thumbnail":    info.get("thumbnail", ""),
+                "author":       info.get("uploader") or info.get("channel") or platform.capitalize(),
+                "duration":     duration_str,
                 "videoStreams": video_streams[:6],
                 "audioStreams": audio_streams[:3],
             },
             "downloadUrl": None,
-            "progress": 0,
-            "error": None,
+            "progress":    0,
+            "error":       None,
         }
 
     except HTTPException:
         raise
-    except subprocess.TimeoutExpired:
-        raise HTTPException(504, "Request timed out. Please try again.")
-    except json.JSONDecodeError:
-        raise HTTPException(500, "Failed to parse media info from yt-dlp.")
+    except yt_dlp.utils.DownloadError as e:
+        print("yt-dlp DownloadError:", str(e))
+        raise HTTPException(422, f"Could not fetch media info: {str(e)[:200]}")
     except Exception as e:
         print("Unexpected error in /analyze:", str(e))
         raise HTTPException(500, f"Unexpected error: {str(e)}")
@@ -151,49 +152,48 @@ def download(req: DownloadRequest):
         ext = "mp3" if req.format == "audio" else "mp4"
         out_template = os.path.join(tmpdir, "media.%(ext)s")
 
-        quality_map = {
-            "4K (2160p)": "bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]/best[height<=2160]",
-            "1080p":      "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080]",
-            "720p":       "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720]",
-            "480p":       "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480]",
-            "360p":       "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[height<=360]",
+        quality_height = {
+            "4K (2160p)": 2160,
+            "1080p": 1080,
+            "720p":   720,
+            "480p":   480,
+            "360p":   360,
         }
+        max_h = quality_height.get(req.quality, 1080)
 
         if req.format == "audio":
-            cmd = [
-                "yt-dlp",
-                "-x",
-                "--audio-format", "mp3",
-                "--audio-quality", "0",
-                "--extractor-args", "youtube:player_client=web",
-                "-o", out_template,
-                url,
-            ]
+            opts = {
+                **YDL_BASE_OPTS,
+                "format": "bestaudio/best",
+                "outtmpl": out_template,
+                "postprocessors": [{
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }],
+            }
         else:
-            fmt = quality_map.get(req.quality, quality_map["1080p"])
-            cmd = [
-                "yt-dlp",
-                "-f", fmt,
-                "--merge-output-format", "mp4",
-                "--extractor-args", "youtube:player_client=web",
-                "-o", out_template,
-                url,
-            ]
+            opts = {
+                **YDL_BASE_OPTS,
+                "format": f"bestvideo[height<={max_h}][ext=mp4]+bestaudio[ext=m4a]/best[height<={max_h}]",
+                "outtmpl": out_template,
+                "merge_output_format": "mp4",
+                "postprocessors": [{
+                    "key": "FFmpegVideoConvertor",
+                    "preferedformat": "mp4",
+                }],
+            }
 
-        print(f"Running yt-dlp command: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-
-        if result.returncode != 0:
-            print("yt-dlp stderr:", result.stderr[:500])
-            raise HTTPException(422, f"Download failed: {result.stderr[:200]}")
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
 
         files = os.listdir(tmpdir)
         if not files:
-            raise HTTPException(500, "No file was produced by yt-dlp.")
+            raise HTTPException(500, "No file was produced.")
 
-        filepath = os.path.join(tmpdir, files[0])
-        safe_title = re.sub(r'[<>:"/\\|?*]', '', os.path.splitext(files[0])[0])[:80]
-        filename = f"{safe_title}.{ext}"
+        filepath  = os.path.join(tmpdir, files[0])
+        safe_name = re.sub(r'[<>:"/\\|?*]', '', os.path.splitext(files[0])[0])[:80]
+        filename  = f"{safe_name}.{ext}"
 
         def stream_file():
             try:
@@ -213,9 +213,10 @@ def download(req: DownloadRequest):
     except HTTPException:
         shutil.rmtree(tmpdir, ignore_errors=True)
         raise
-    except subprocess.TimeoutExpired:
+    except yt_dlp.utils.DownloadError as e:
         shutil.rmtree(tmpdir, ignore_errors=True)
-        raise HTTPException(504, "Download timed out. Try a lower quality.")
+        print("yt-dlp DownloadError:", str(e))
+        raise HTTPException(422, f"Download failed: {str(e)[:200]}")
     except Exception as e:
         shutil.rmtree(tmpdir, ignore_errors=True)
         print("Unexpected error in /download:", str(e))
