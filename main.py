@@ -1,9 +1,10 @@
-import os, re, json, tempfile, shutil
+import os, re, json, tempfile, shutil, urllib.parse
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 import yt_dlp
+import urllib.request
 
 app = FastAPI()
 
@@ -33,12 +34,30 @@ def detect_platform(url: str):
             return platform
     return None
 
+def extract_youtube_id(url: str):
+    try:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.hostname == "youtu.be":
+            return parsed.path.lstrip("/").split("/")[0]
+        qs = urllib.parse.parse_qs(parsed.query)
+        if "v" in qs:
+            return qs["v"][0]
+        path = parsed.path
+        for segment in ["shorts", "live", "embed"]:
+            if segment in path:
+                parts = path.split(segment + "/")
+                if len(parts) > 1:
+                    return parts[1].split("/")[0]
+    except Exception:
+        pass
+    return None
+
 YDL_BASE_OPTS = {
     "quiet": True,
-    "no_warnings": False,
+    "no_warnings": True,
     "extractor_args": {
         "youtube": {
-            "player_client": ["ios", "android", "web"],
+            "player_client": ["ios"],
         }
     },
     "http_headers": {
@@ -52,7 +71,7 @@ class AnalyzeRequest(BaseModel):
 class DownloadRequest(BaseModel):
     url: str
     format: str = "video"
-    quality: str = "1080p"
+    quality: str = "720p"
 
 
 @app.get("/health")
@@ -65,29 +84,6 @@ def debug():
     return {"yt-dlp-version": yt_dlp.version.__version__}
 
 
-@app.post("/formats")
-def formats(req: AnalyzeRequest):
-    opts = {
-        **YDL_BASE_OPTS,
-        "skip_download": True,
-        "format": "best/bestvideo+bestaudio",
-    }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(req.url.strip(), download=False)
-    available = [
-        {
-            "id": f.get("format_id"),
-            "ext": f.get("ext"),
-            "height": f.get("height"),
-            "note": f.get("format_note"),
-            "vcodec": f.get("vcodec"),
-            "acodec": f.get("acodec"),
-        }
-        for f in info.get("formats", [])
-    ]
-    return {"count": len(available), "formats": available}
-
-
 @app.post("/analyze")
 def analyze(req: AnalyzeRequest):
     url = req.url.strip()
@@ -98,68 +94,87 @@ def analyze(req: AnalyzeRequest):
     if not platform:
         raise HTTPException(400, "This platform is not yet supported. Try YouTube, Facebook, or Instagram.")
 
-    opts = {
-        **YDL_BASE_OPTS,
-        "skip_download": True,
-        "format": "best/bestvideo+bestaudio",
-    }
-
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+        if platform == "youtube":
+            video_id = extract_youtube_id(url)
+            if not video_id:
+                raise HTTPException(400, "Could not extract YouTube video ID.")
 
-        if not info:
-            raise HTTPException(422, "Could not fetch media info. The video may be private or restricted.")
+            # Use oEmbed for title/author (no API key needed)
+            oembed_url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
+            try:
+                with urllib.request.urlopen(oembed_url, timeout=10) as r:
+                    oembed = json.loads(r.read().decode())
+                title = oembed.get("title", "YouTube Video")
+                author = oembed.get("author_name", "Unknown")
+                thumbnail = oembed.get("thumbnail_url", f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg")
+            except Exception:
+                title = "YouTube Video"
+                author = "Unknown"
+                thumbnail = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
 
-        video_streams = []
-        audio_streams = []
+            # Build stream options pointing back through our /download endpoint
+            # so the frontend has quality choices without needing raw YT stream URLs
+            base = os.getenv("RENDER_EXTERNAL_URL", "")
+            video_streams = [
+                {"url": f"{base}/download", "quality": "1080p", "mimeType": "video/mp4"},
+                {"url": f"{base}/download", "quality": "720p",  "mimeType": "video/mp4"},
+                {"url": f"{base}/download", "quality": "480p",  "mimeType": "video/mp4"},
+                {"url": f"{base}/download", "quality": "360p",  "mimeType": "video/mp4"},
+            ]
+            audio_streams = [
+                {"url": f"{base}/download", "quality": "192 kbps", "mimeType": "audio/mp3"},
+            ]
 
-        for f in info.get("formats", []):
-            vcodec = f.get("vcodec", "none")
-            acodec = f.get("acodec", "none")
-            height = f.get("height")
-            ext = f.get("ext", "mp4")
-            furl = f.get("url", "")
+            return {
+                "phase": "ready",
+                "videoInfo": {
+                    "title": title,
+                    "thumbnail": thumbnail,
+                    "author": author,
+                    "duration": "--:--",
+                    "videoStreams": video_streams,
+                    "audioStreams": audio_streams,
+                },
+                "downloadUrl": None,
+                "progress": 0,
+                "error": None,
+            }
 
-            if not furl:
-                continue
-
-            if vcodec != "none" and acodec != "none" and height:
-                video_streams.append({
-                    "url": furl,
-                    "quality": f.get("format_note") or f"{height}p",
-                    "mimeType": f"video/{ext}",
-                })
-            elif vcodec == "none" and acodec != "none":
-                bitrate = f.get("abr") or f.get("tbr") or 128
-                audio_streams.append({
-                    "url": furl,
-                    "quality": f"{int(bitrate)} kbps",
-                    "mimeType": f"audio/{ext}",
-                })
-
-        duration_secs = info.get("duration")
-        if duration_secs:
-            mins = int(duration_secs) // 60
-            secs = int(duration_secs) % 60
-            duration_str = f"{mins}:{secs:02d}"
         else:
-            duration_str = "--:--"
+            # Facebook / Instagram — use yt-dlp (less rate limited than YouTube)
+            opts = {
+                **YDL_BASE_OPTS,
+                "skip_download": True,
+            }
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
 
-        return {
-            "phase": "ready",
-            "videoInfo": {
-                "title": info.get("title", "Media"),
-                "thumbnail": info.get("thumbnail", ""),
-                "author": info.get("uploader") or info.get("channel") or platform.capitalize(),
-                "duration": duration_str,
-                "videoStreams": video_streams[:6],
-                "audioStreams": audio_streams[:3],
-            },
-            "downloadUrl": None,
-            "progress": 0,
-            "error": None,
-        }
+            if not info:
+                raise HTTPException(422, "Could not fetch media info.")
+
+            duration_secs = info.get("duration")
+            duration_str = "--:--"
+            if duration_secs:
+                mins = int(duration_secs) // 60
+                secs = int(duration_secs) % 60
+                duration_str = f"{mins}:{secs:02d}"
+
+            base = os.getenv("RENDER_EXTERNAL_URL", "")
+            return {
+                "phase": "ready",
+                "videoInfo": {
+                    "title": info.get("title", "Media"),
+                    "thumbnail": info.get("thumbnail", ""),
+                    "author": info.get("uploader") or info.get("channel") or platform.capitalize(),
+                    "duration": duration_str,
+                    "videoStreams": [{"url": f"{base}/download", "quality": "Best", "mimeType": "video/mp4"}],
+                    "audioStreams": [{"url": f"{base}/download", "quality": "Best", "mimeType": "audio/mp3"}],
+                },
+                "downloadUrl": None,
+                "progress": 0,
+                "error": None,
+            }
 
     except HTTPException:
         raise
@@ -191,7 +206,7 @@ def download(req: DownloadRequest):
             "480p": 480,
             "360p": 360,
         }
-        max_h = quality_height.get(req.quality, 1080)
+        max_h = quality_height.get(req.quality, 720)
 
         if req.format == "audio":
             opts = {
@@ -209,15 +224,9 @@ def download(req: DownloadRequest):
         else:
             opts = {
                 **YDL_BASE_OPTS,
-                "format": f"bestvideo[height<={max_h}]+bestaudio/bestvideo[height<={max_h}]/best[height<={max_h}]/best",
+                "format": f"bestvideo[height<={max_h}]+bestaudio/best[height<={max_h}]/best",
                 "outtmpl": out_template,
                 "merge_output_format": "mp4",
-                "postprocessors": [
-                    {
-                        "key": "FFmpegVideoConvertor",
-                        "preferedformat": "mp4",
-                    }
-                ],
             }
 
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -252,7 +261,7 @@ def download(req: DownloadRequest):
     except yt_dlp.utils.DownloadError as e:
         shutil.rmtree(tmpdir, ignore_errors=True)
         print("yt-dlp DownloadError:", str(e))
-        raise HTTPException(422, f"Download failed: {str(e)[:200]}")
+        raise HTTPException(422, f"Download failed. The video may be restricted: {str(e)[:150]}")
     except Exception as e:
         shutil.rmtree(tmpdir, ignore_errors=True)
         print("Unexpected error in /download:", str(e))
