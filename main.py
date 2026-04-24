@@ -53,8 +53,9 @@ def extract_youtube_id(url: str):
     return None
 
 YDL_BASE_OPTS = {
-    "quiet": True,
-    "no_warnings": True,
+    "quiet": False,
+    "no_warnings": False,
+    "socket_timeout": 30,
     "extractor_args": {
         "youtube": {
             "player_client": ["ios"],
@@ -100,7 +101,6 @@ def analyze(req: AnalyzeRequest):
             if not video_id:
                 raise HTTPException(400, "Could not extract YouTube video ID.")
 
-            # Use oEmbed for title/author (no API key needed)
             oembed_url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
             try:
                 with urllib.request.urlopen(oembed_url, timeout=10) as r:
@@ -113,8 +113,6 @@ def analyze(req: AnalyzeRequest):
                 author = "Unknown"
                 thumbnail = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
 
-            # Build stream options pointing back through our /download endpoint
-            # so the frontend has quality choices without needing raw YT stream URLs
             base = os.getenv("RENDER_EXTERNAL_URL", "")
             video_streams = [
                 {"url": f"{base}/download", "quality": "1080p", "mimeType": "video/mp4"},
@@ -142,7 +140,6 @@ def analyze(req: AnalyzeRequest):
             }
 
         else:
-            # Facebook / Instagram — use yt-dlp (less rate limited than YouTube)
             opts = {
                 **YDL_BASE_OPTS,
                 "skip_download": True,
@@ -224,10 +221,13 @@ def download(req: DownloadRequest):
         else:
             opts = {
                 **YDL_BASE_OPTS,
-                "format": f"bestvideo[height<={max_h}]+bestaudio/best[height<={max_h}]/best",
+                # most permissive format chain — tries progressively simpler options
+                "format": f"best[height<={max_h}]/best",
                 "outtmpl": out_template,
                 "merge_output_format": "mp4",
             }
+
+        print(f"Starting download: format={req.format} quality={req.quality} url={url}")
 
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([url])
@@ -239,6 +239,8 @@ def download(req: DownloadRequest):
         filepath = os.path.join(tmpdir, files[0])
         safe_name = re.sub(r'[<>:"/\\|?*]', '', os.path.splitext(files[0])[0])[:80]
         filename = f"{safe_name}.{ext}"
+
+        print(f"Download complete: {filename} ({os.path.getsize(filepath)} bytes)")
 
         def stream_file():
             try:
