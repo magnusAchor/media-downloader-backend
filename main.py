@@ -56,13 +56,14 @@ YDL_BASE_OPTS = {
     "quiet": False,
     "no_warnings": False,
     "socket_timeout": 30,
+    "cookiefile": "/opt/render/project/src/cookies.txt",
     "extractor_args": {
         "youtube": {
-            "player_client": ["mweb", "web_creator"],
+            "player_client": ["web", "mweb"],
         }
     },
     "http_headers": {
-        "User-Agent": "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
     },
 }
 
