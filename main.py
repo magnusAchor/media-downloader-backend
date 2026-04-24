@@ -57,6 +57,7 @@ YDL_BASE_OPTS = {
     "no_warnings": False,
     "socket_timeout": 30,
     "cookiefile": "/opt/render/project/src/cookies.txt",
+    "proxy": os.getenv("PROXY_URL", ""),
     "extractor_args": {
         "youtube": {
             "player_client": ["web", "mweb"],

@@ -1,1 +1,1 @@
-{"detail":"Download failed. The video may be restricted: ERROR: [youtube] dQw4w9WgXcQ: Failed to extract any player response; please report this issue on  https://github.com/yt-dlp/yt-dlp/issues?q= , filling"}
+{"detail":"Download failed. The video may be restricted: ERROR: [youtube] dQw4w9WgXcQ: Requested format is not available. Use --list-formats for a list of available formats"}
