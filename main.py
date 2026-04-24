@@ -70,7 +70,6 @@ PIPED_INSTANCES = [
 ]
 
 def fetch_streams(video_id: str):
-    # --- Try Invidious first ---
     for instance in INVIDIOUS_INSTANCES:
         try:
             req_url = f"{instance}/api/v1/videos/{video_id}?fields=title,author,videoThumbnails,lengthSeconds,adaptiveFormats,formatStreams"
@@ -127,7 +126,6 @@ def fetch_streams(video_id: str):
             print(f"Invidious {instance} failed: {e}")
             continue
 
-    # --- Try Piped as fallback ---
     for instance in PIPED_INSTANCES:
         try:
             req_url = f"{instance}/streams/{video_id}"
@@ -221,16 +219,12 @@ def analyze(req: AnalyzeRequest):
             if not video_id:
                 raise HTTPException(400, "Could not extract YouTube video ID.")
 
-            # Get title/author/thumbnail from oEmbed
             title = "YouTube Video"
             author = "Unknown"
             thumbnail = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
             try:
                 oembed_url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
-                request = urllib.request.Request(
-                    oembed_url,
-                    headers={"User-Agent": "Mozilla/5.0"},
-                )
+                request = urllib.request.Request(oembed_url, headers={"User-Agent": "Mozilla/5.0"})
                 with urllib.request.urlopen(request, timeout=10) as r:
                     oembed = json.loads(r.read().decode())
                 title = oembed.get("title", title)
@@ -239,9 +233,7 @@ def analyze(req: AnalyzeRequest):
             except Exception as e:
                 print(f"oEmbed failed: {e}")
 
-            # Get stream options from Invidious/Piped
             streams_data = fetch_streams(video_id)
-
             video_streams = []
             audio_streams = []
 
@@ -262,7 +254,6 @@ def analyze(req: AnalyzeRequest):
                             "mimeType": s.get("mimeType", "audio/mp4"),
                         })
 
-            # Fallback if all APIs are down
             if not video_streams:
                 base = os.getenv("RENDER_EXTERNAL_URL", "")
                 video_streams = [
@@ -293,7 +284,6 @@ def analyze(req: AnalyzeRequest):
             }
 
         else:
-            # Facebook / Instagram
             opts = {**YDL_BASE_OPTS, "skip_download": True}
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -361,17 +351,11 @@ def download(req: DownloadRequest):
                 audio_streams = streams_data.get("audioStreams", [])
                 if not audio_streams:
                     raise HTTPException(422, "No audio streams available for this video.")
-                stream = sorted(
-                    audio_streams,
-                    key=lambda s: s.get("bitrate", 0),
-                    reverse=True
-                )[0]
+                stream = sorted(audio_streams, key=lambda s: s.get("bitrate", 0), reverse=True)[0]
                 stream_url = stream["url"]
                 filename = "audio.mp3"
-
             else:
                 video_streams = streams_data.get("videoStreams", [])
-                # prefer combined streams at or below requested height
                 combined = [
                     s for s in video_streams
                     if not s.get("videoOnly", True)
@@ -379,20 +363,12 @@ def download(req: DownloadRequest):
                     and (s.get("height") or 0) <= max_h
                 ]
                 if not combined:
-                    combined = [
-                        s for s in video_streams
-                        if not s.get("videoOnly", True) and s.get("url")
-                    ]
+                    combined = [s for s in video_streams if not s.get("videoOnly", True) and s.get("url")]
                 if not combined:
                     combined = [s for s in video_streams if s.get("url")]
                 if not combined:
                     raise HTTPException(422, "No video streams available for this video.")
-
-                stream = sorted(
-                    combined,
-                    key=lambda s: s.get("height") or 0,
-                    reverse=True
-                )[0]
+                stream = sorted(combined, key=lambda s: s.get("height") or 0, reverse=True)[0]
                 stream_url = stream["url"]
                 filename = "video.mp4"
 
@@ -404,7 +380,6 @@ def download(req: DownloadRequest):
             }
 
         else:
-            # Facebook / Instagram — stream through server using yt-dlp
             tmpdir = tempfile.mkdtemp()
             try:
                 ext = "mp3" if req.format == "audio" else "mp4"
