@@ -58,11 +58,11 @@ YDL_BASE_OPTS = {
     "socket_timeout": 30,
     "extractor_args": {
         "youtube": {
-            "player_client": ["ios"],
+            "player_client": ["mweb", "web_creator"],
         }
     },
     "http_headers": {
-        "User-Agent": "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36",
     },
 }
 
