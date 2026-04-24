@@ -1,10 +1,9 @@
-import os, re, json, tempfile, shutil, urllib.parse
+import os, re, json, tempfile, shutil, urllib.parse, urllib.request
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import yt_dlp
-import urllib.request
 
 app = FastAPI()
 
@@ -52,12 +51,39 @@ def extract_youtube_id(url: str):
         pass
     return None
 
+# Piped public instances — all free, no API key needed
+PIPED_INSTANCES = [
+    "https://pipedapi.kavin.rocks",
+    "https://piped-api.garudalinux.org",
+    "https://api.piped.projectsegfau.lt",
+    "https://pipedapi.in.projectsegfau.lt",
+    "https://pipedapi.adminforge.de",
+]
+
+def fetch_piped_streams(video_id: str):
+    """Try each Piped instance until one works. Returns raw streams data or None."""
+    for instance in PIPED_INSTANCES:
+        try:
+            req_url = f"{instance}/streams/{video_id}"
+            print(f"Trying Piped instance: {instance}")
+            request = urllib.request.Request(
+                req_url,
+                headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+            )
+            with urllib.request.urlopen(request, timeout=10) as r:
+                data = json.loads(r.read().decode())
+            if data and ("videoStreams" in data or "audioStreams" in data):
+                print(f"Piped success: {instance}")
+                return data
+        except Exception as e:
+            print(f"Piped instance {instance} failed: {e}")
+            continue
+    return None
+
 YDL_BASE_OPTS = {
     "quiet": False,
     "no_warnings": False,
     "socket_timeout": 30,
-    "cookiefile": "/opt/render/project/src/cookies.txt",
-    "proxy": os.getenv("PROXY_URL", ""),
     "extractor_args": {
         "youtube": {
             "player_client": ["web", "mweb"],
@@ -103,28 +129,60 @@ def analyze(req: AnalyzeRequest):
             if not video_id:
                 raise HTTPException(400, "Could not extract YouTube video ID.")
 
-            oembed_url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
+            # Step 1: get title/author/thumbnail from oEmbed (free, no key needed)
+            title = "YouTube Video"
+            author = "Unknown"
+            thumbnail = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
             try:
-                with urllib.request.urlopen(oembed_url, timeout=10) as r:
+                oembed_url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
+                request = urllib.request.Request(
+                    oembed_url,
+                    headers={"User-Agent": "Mozilla/5.0"},
+                )
+                with urllib.request.urlopen(request, timeout=10) as r:
                     oembed = json.loads(r.read().decode())
-                title = oembed.get("title", "YouTube Video")
-                author = oembed.get("author_name", "Unknown")
-                thumbnail = oembed.get("thumbnail_url", f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg")
-            except Exception:
-                title = "YouTube Video"
-                author = "Unknown"
-                thumbnail = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
+                title = oembed.get("title", title)
+                author = oembed.get("author_name", author)
+                thumbnail = oembed.get("thumbnail_url", thumbnail)
+            except Exception as e:
+                print(f"oEmbed failed: {e}")
 
-            base = os.getenv("RENDER_EXTERNAL_URL", "")
-            video_streams = [
-                {"url": f"{base}/download", "quality": "1080p", "mimeType": "video/mp4"},
-                {"url": f"{base}/download", "quality": "720p",  "mimeType": "video/mp4"},
-                {"url": f"{base}/download", "quality": "480p",  "mimeType": "video/mp4"},
-                {"url": f"{base}/download", "quality": "360p",  "mimeType": "video/mp4"},
-            ]
-            audio_streams = [
-                {"url": f"{base}/download", "quality": "192 kbps", "mimeType": "audio/mp3"},
-            ]
+            # Step 2: get stream quality options from Piped (free, no key needed)
+            video_streams = []
+            audio_streams = []
+            streams_data = fetch_piped_streams(video_id)
+
+            if streams_data:
+                for s in streams_data.get("videoStreams", []):
+                    if not s.get("videoOnly", True) and s.get("url"):
+                        video_streams.append({
+                            "url": s["url"],
+                            "quality": s.get("quality") or f"{s.get('height', '?')}p",
+                            "mimeType": s.get("mimeType", "video/mp4"),
+                        })
+                for s in streams_data.get("audioStreams", []):
+                    if s.get("url"):
+                        bitrate = s.get("bitrate", 128000)
+                        audio_streams.append({
+                            "url": s["url"],
+                            "quality": f"{int(bitrate / 1000)} kbps",
+                            "mimeType": s.get("mimeType", "audio/mp4"),
+                        })
+
+            # Fallback quality list if Piped is down
+            if not video_streams:
+                base = os.getenv("RENDER_EXTERNAL_URL", "")
+                video_streams = [
+                    {"url": f"{base}/download", "quality": "1080p", "mimeType": "video/mp4"},
+                    {"url": f"{base}/download", "quality": "720p",  "mimeType": "video/mp4"},
+                    {"url": f"{base}/download", "quality": "480p",  "mimeType": "video/mp4"},
+                    {"url": f"{base}/download", "quality": "360p",  "mimeType": "video/mp4"},
+                ]
+            if not audio_streams:
+                base = os.getenv("RENDER_EXTERNAL_URL", "")
+                audio_streams = [
+                    {"url": f"{base}/download", "quality": "192 kbps", "mimeType": "audio/mp3"},
+                ]
 
             return {
                 "phase": "ready",
@@ -133,8 +191,8 @@ def analyze(req: AnalyzeRequest):
                     "thumbnail": thumbnail,
                     "author": author,
                     "duration": "--:--",
-                    "videoStreams": video_streams,
-                    "audioStreams": audio_streams,
+                    "videoStreams": video_streams[:6],
+                    "audioStreams": audio_streams[:3],
                 },
                 "downloadUrl": None,
                 "progress": 0,
@@ -142,10 +200,8 @@ def analyze(req: AnalyzeRequest):
             }
 
         else:
-            opts = {
-                **YDL_BASE_OPTS,
-                "skip_download": True,
-            }
+            # Facebook / Instagram
+            opts = {**YDL_BASE_OPTS, "skip_download": True}
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
 
@@ -177,9 +233,6 @@ def analyze(req: AnalyzeRequest):
 
     except HTTPException:
         raise
-    except yt_dlp.utils.DownloadError as e:
-        print("yt-dlp DownloadError:", str(e))
-        raise HTTPException(422, f"Could not fetch media info: {str(e)[:200]}")
     except Exception as e:
         print("Unexpected error in /analyze:", str(e))
         raise HTTPException(500, f"Unexpected error: {str(e)}")
@@ -192,81 +245,127 @@ def download(req: DownloadRequest):
     if not platform:
         raise HTTPException(400, "Unsupported platform.")
 
-    tmpdir = tempfile.mkdtemp()
-
     try:
-        ext = "mp3" if req.format == "audio" else "mp4"
-        out_template = os.path.join(tmpdir, "media.%(ext)s")
+        if platform == "youtube":
+            video_id = extract_youtube_id(url)
+            if not video_id:
+                raise HTTPException(400, "Could not extract YouTube video ID.")
 
-        quality_height = {
-            "4K (2160p)": 2160,
-            "1080p": 1080,
-            "720p": 720,
-            "480p": 480,
-            "360p": 360,
-        }
-        max_h = quality_height.get(req.quality, 720)
+            streams_data = fetch_piped_streams(video_id)
+            if not streams_data:
+                raise HTTPException(422, "Could not fetch stream URLs. All Piped instances are unavailable. Please try again later.")
 
-        if req.format == "audio":
-            opts = {
-                **YDL_BASE_OPTS,
-                "format": "bestaudio/best",
-                "outtmpl": out_template,
-                "postprocessors": [
-                    {
-                        "key": "FFmpegExtractAudio",
-                        "preferredcodec": "mp3",
-                        "preferredquality": "192",
-                    }
-                ],
+            quality_height = {
+                "4K (2160p)": 2160,
+                "1080p": 1080,
+                "720p": 720,
+                "480p": 480,
+                "360p": 360,
             }
+            max_h = quality_height.get(req.quality, 720)
+
+            if req.format == "audio":
+                audio_streams = streams_data.get("audioStreams", [])
+                if not audio_streams:
+                    raise HTTPException(422, "No audio streams available for this video.")
+                # pick highest quality audio
+                stream = sorted(audio_streams, key=lambda s: s.get("bitrate", 0), reverse=True)[0]
+                stream_url = stream["url"]
+                filename = "audio.mp3"
+
+            else:
+                video_streams = streams_data.get("videoStreams", [])
+                # prefer combined streams (video+audio) at or below requested height
+                combined = [
+                    s for s in video_streams
+                    if not s.get("videoOnly", True)
+                    and s.get("url")
+                    and (s.get("height") or 0) <= max_h
+                ]
+                if not combined:
+                    # relax height constraint
+                    combined = [s for s in video_streams if not s.get("videoOnly", True) and s.get("url")]
+                if not combined:
+                    # take anything
+                    combined = [s for s in video_streams if s.get("url")]
+                if not combined:
+                    raise HTTPException(422, "No video streams available for this video.")
+
+                # pick best quality within limit
+                stream = sorted(combined, key=lambda s: s.get("height") or 0, reverse=True)[0]
+                stream_url = stream["url"]
+                filename = "video.mp4"
+
+            print(f"Returning direct stream URL for {platform}: {stream_url[:80]}...")
+            return {
+                "downloadUrl": stream_url,
+                "filename": filename,
+                "direct": True,
+            }
+
         else:
-            opts = {
-                **YDL_BASE_OPTS,
-                # most permissive format chain — tries progressively simpler options
-                "format": f"best[height<={max_h}]/best",
-                "outtmpl": out_template,
-                "merge_output_format": "mp4",
-            }
-
-        print(f"Starting download: format={req.format} quality={req.quality} url={url}")
-
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([url])
-
-        files = os.listdir(tmpdir)
-        if not files:
-            raise HTTPException(500, "No file was produced.")
-
-        filepath = os.path.join(tmpdir, files[0])
-        safe_name = re.sub(r'[<>:"/\\|?*]', '', os.path.splitext(files[0])[0])[:80]
-        filename = f"{safe_name}.{ext}"
-
-        print(f"Download complete: {filename} ({os.path.getsize(filepath)} bytes)")
-
-        def stream_file():
+            # Facebook / Instagram — use yt-dlp and stream through server
+            tmpdir = tempfile.mkdtemp()
             try:
-                with open(filepath, "rb") as f:
-                    while chunk := f.read(1024 * 256):
-                        yield chunk
-            finally:
-                shutil.rmtree(tmpdir, ignore_errors=True)
+                ext = "mp3" if req.format == "audio" else "mp4"
+                out_template = os.path.join(tmpdir, "media.%(ext)s")
 
-        media_type = "audio/mpeg" if ext == "mp3" else "video/mp4"
-        return StreamingResponse(
-            stream_file(),
-            media_type=media_type,
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-        )
+                if req.format == "audio":
+                    opts = {
+                        **YDL_BASE_OPTS,
+                        "format": "bestaudio/best",
+                        "outtmpl": out_template,
+                        "postprocessors": [{
+                            "key": "FFmpegExtractAudio",
+                            "preferredcodec": "mp3",
+                            "preferredquality": "192",
+                        }],
+                    }
+                else:
+                    opts = {
+                        **YDL_BASE_OPTS,
+                        "format": "best",
+                        "outtmpl": out_template,
+                        "merge_output_format": "mp4",
+                    }
+
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    ydl.download([url])
+
+                files = os.listdir(tmpdir)
+                if not files:
+                    raise HTTPException(500, "No file was produced.")
+
+                filepath = os.path.join(tmpdir, files[0])
+                safe_name = re.sub(r'[<>:"/\\|?*]', '', os.path.splitext(files[0])[0])[:80]
+                filename = f"{safe_name}.{ext}"
+
+                print(f"Streaming file: {filename} ({os.path.getsize(filepath)} bytes)")
+
+                def stream_file():
+                    try:
+                        with open(filepath, "rb") as f:
+                            while chunk := f.read(1024 * 256):
+                                yield chunk
+                    finally:
+                        shutil.rmtree(tmpdir, ignore_errors=True)
+
+                media_type = "audio/mpeg" if ext == "mp3" else "video/mp4"
+                return StreamingResponse(
+                    stream_file(),
+                    media_type=media_type,
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+                )
+
+            except Exception:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+                raise
 
     except HTTPException:
-        shutil.rmtree(tmpdir, ignore_errors=True)
         raise
     except yt_dlp.utils.DownloadError as e:
-        shutil.rmtree(tmpdir, ignore_errors=True)
         print("yt-dlp DownloadError:", str(e))
-        raise HTTPException(422, f"Download failed. The video may be restricted: {str(e)[:150]}")
+        raise HTTPException(422, f"Download failed: {str(e)[:150]}")
     except Exception as e:
-        shutil.rmtree(tmpdir, ignore_errors=True)
         print("Unexpected error in /download:", str(e))
         raise HTTPException(500, f"Unexpected error: {str(e)}")
